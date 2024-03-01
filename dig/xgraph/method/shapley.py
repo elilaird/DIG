@@ -16,6 +16,7 @@ def GnnNetsGC2valueFunc(gnnNets, target_class):
             probs = F.softmax(logits, dim=-1)
             score = probs[:, target_class]
         return score
+
     return value_func
 
 
@@ -29,13 +30,14 @@ def GnnNetsNC2valueFunc(gnnNets_NC, node_idx, target_class):
             probs = probs.reshape(batch_size, -1, probs.shape[-1])
             score = probs[:, node_idx, target_class]
             return score
+
     return value_func
 
 
 def get_graph_build_func(build_method):
-    if build_method.lower() == 'zero_filling':
+    if build_method.lower() == "zero_filling":
         return graph_build_zero_filling
-    elif build_method.lower() == 'split':
+    elif build_method.lower() == "split":
         return graph_build_split
     else:
         raise NotImplementedError
@@ -49,26 +51,49 @@ class MarginalSubgraphDataset(Dataset):
         self.device = self.X.device
 
         self.label = data.y
-        self.exclude_mask = torch.tensor(exclude_mask).type(torch.float32).to(self.device)
-        self.include_mask = torch.tensor(include_mask).type(torch.float32).to(self.device)
+        self.exclude_mask = (
+            torch.tensor(exclude_mask).type(torch.float32).to(self.device)
+        )
+        self.include_mask = (
+            torch.tensor(include_mask).type(torch.float32).to(self.device)
+        )
         self.subgraph_build_func = subgraph_build_func
 
     def __len__(self):
         return self.exclude_mask.shape[0]
 
     def __getitem__(self, idx):
-        exclude_graph_X, exclude_graph_edge_index = self.subgraph_build_func(self.X, self.edge_index, self.exclude_mask[idx])
-        include_graph_X, include_graph_edge_index = self.subgraph_build_func(self.X, self.edge_index, self.include_mask[idx])
+        exclude_graph_X, exclude_graph_edge_index = self.subgraph_build_func(
+            self.X, self.edge_index, self.exclude_mask[idx]
+        )
+        include_graph_X, include_graph_edge_index = self.subgraph_build_func(
+            self.X, self.edge_index, self.include_mask[idx]
+        )
         exclude_data = Data(x=exclude_graph_X, edge_index=exclude_graph_edge_index)
         include_data = Data(x=include_graph_X, edge_index=include_graph_edge_index)
         return exclude_data, include_data
 
+    def len(self) -> int:
+        return self.__len__()
 
-def marginal_contribution(data: Data, exclude_mask: np.array, include_mask: np.array,
-                          value_func, subgraph_build_func):
-    """ Calculate the marginal value for each pair. Here exclude_mask and include_mask are node mask. """
-    marginal_subgraph_dataset = MarginalSubgraphDataset(data, exclude_mask, include_mask, subgraph_build_func)
-    dataloader = DataLoader(marginal_subgraph_dataset, batch_size=256, shuffle=False, num_workers=0)
+    def get(self, idx) -> tuple:
+        return self.__getitem__(idx)
+
+
+def marginal_contribution(
+    data: Data,
+    exclude_mask: np.array,
+    include_mask: np.array,
+    value_func,
+    subgraph_build_func,
+):
+    """Calculate the marginal value for each pair. Here exclude_mask and include_mask are node mask."""
+    marginal_subgraph_dataset = MarginalSubgraphDataset(
+        data, exclude_mask, include_mask, subgraph_build_func
+    )
+    dataloader = DataLoader(
+        marginal_subgraph_dataset, batch_size=256, shuffle=False, num_workers=0
+    )
 
     marginal_contribution_list = []
 
@@ -83,13 +108,13 @@ def marginal_contribution(data: Data, exclude_mask: np.array, include_mask: np.a
 
 
 def graph_build_zero_filling(X, edge_index, node_mask: np.array):
-    """ subgraph building through masking the unselected nodes with zero features """
+    """subgraph building through masking the unselected nodes with zero features"""
     ret_X = X * node_mask.unsqueeze(1)
     return ret_X, edge_index
 
 
 def graph_build_split(X, edge_index, node_mask: np.array):
-    """ subgraph building through spliting the selected nodes from the original graph """
+    """subgraph building through spliting the selected nodes from the original graph"""
     ret_X = X
     row, col = edge_index
     edge_mask = (node_mask[row] == 1) & (node_mask[col] == 1)
@@ -97,9 +122,14 @@ def graph_build_split(X, edge_index, node_mask: np.array):
     return ret_X, ret_edge_index
 
 
-def l_shapley(coalition: list, data: Data, local_radius: int,
-              value_func: str, subgraph_building_method='zero_filling'):
-    """ shapley value where players are local neighbor nodes """
+def l_shapley(
+    coalition: list,
+    data: Data,
+    local_radius: int,
+    value_func: str,
+    subgraph_building_method="zero_filling",
+):
+    """shapley value where players are local neighbor nodes"""
     graph = to_networkx(data)
     num_nodes = graph.number_of_nodes()
     subgraph_build_func = get_graph_build_func(subgraph_building_method)
@@ -133,22 +163,29 @@ def l_shapley(coalition: list, data: Data, local_radius: int,
     exclude_mask = np.stack(set_exclude_masks, axis=0)
     include_mask = np.stack(set_include_masks, axis=0)
     num_players = len(nodes_around) + 1
-    num_player_in_set = num_players - 1 + len(coalition) - (1 - exclude_mask).sum(axis=1)
+    num_player_in_set = (
+        num_players - 1 + len(coalition) - (1 - exclude_mask).sum(axis=1)
+    )
     p = num_players
     S = num_player_in_set
     coeffs = torch.tensor(1.0 / comb(p, S) / (p - S + 1e-6))
 
-    marginal_contributions = \
-        marginal_contribution(data, exclude_mask, include_mask, value_func, subgraph_build_func)
+    marginal_contributions = marginal_contribution(
+        data, exclude_mask, include_mask, value_func, subgraph_build_func
+    )
 
     l_shapley_value = (marginal_contributions.squeeze().cpu() * coeffs).sum().item()
     return l_shapley_value
 
 
-def mc_shapley(coalition: list, data: Data,
-               value_func: str, subgraph_building_method='zero_filling',
-               sample_num=1000) -> float:
-    """ monte carlo sampling approximation of the shapley value """
+def mc_shapley(
+    coalition: list,
+    data: Data,
+    value_func: str,
+    subgraph_building_method="zero_filling",
+    sample_num=1000,
+) -> float:
+    """monte carlo sampling approximation of the shapley value"""
     subset_build_func = get_graph_build_func(subgraph_building_method)
 
     num_nodes = data.num_nodes
@@ -173,16 +210,23 @@ def mc_shapley(coalition: list, data: Data,
 
     exclude_mask = np.stack(set_exclude_masks, axis=0)
     include_mask = np.stack(set_include_masks, axis=0)
-    marginal_contributions = marginal_contribution(data, exclude_mask, include_mask, value_func, subset_build_func)
+    marginal_contributions = marginal_contribution(
+        data, exclude_mask, include_mask, value_func, subset_build_func
+    )
     mc_shapley_value = marginal_contributions.mean().item()
 
     return mc_shapley_value
 
 
-def mc_l_shapley(coalition: list, data: Data, local_radius: int,
-                 value_func: str, subgraph_building_method='zero_filling',
-                 sample_num=1000) -> float:
-    """ monte carlo sampling approximation of the l_shapley value """
+def mc_l_shapley(
+    coalition: list,
+    data: Data,
+    local_radius: int,
+    value_func: str,
+    subgraph_building_method="zero_filling",
+    sample_num=1000,
+) -> float:
+    """monte carlo sampling approximation of the l_shapley value"""
     graph = to_networkx(data)
     num_nodes = graph.number_of_nodes()
     subgraph_build_func = get_graph_build_func(subgraph_building_method)
@@ -215,16 +259,21 @@ def mc_l_shapley(coalition: list, data: Data, local_radius: int,
 
     exclude_mask = np.stack(set_exclude_masks, axis=0)
     include_mask = np.stack(set_include_masks, axis=0)
-    marginal_contributions = \
-        marginal_contribution(data, exclude_mask, include_mask, value_func, subgraph_build_func)
+    marginal_contributions = marginal_contribution(
+        data, exclude_mask, include_mask, value_func, subgraph_build_func
+    )
 
     mc_l_shapley_value = (marginal_contributions).mean().item()
     return mc_l_shapley_value
 
 
-def gnn_score(coalition: list, data: Data, value_func: str,
-              subgraph_building_method='zero_filling') -> torch.Tensor:
-    """ the value of subgraph with selected nodes """
+def gnn_score(
+    coalition: list,
+    data: Data,
+    value_func: str,
+    subgraph_building_method="zero_filling",
+) -> torch.Tensor:
+    """the value of subgraph with selected nodes"""
     num_nodes = data.num_nodes
     subgraph_build_func = get_graph_build_func(subgraph_building_method)
     mask = torch.zeros(num_nodes).type(torch.float32).to(data.x.device)
@@ -237,10 +286,16 @@ def gnn_score(coalition: list, data: Data, value_func: str,
     return score.item()
 
 
-def NC_mc_l_shapley(coalition: list, data: Data, local_radius: int,
-                    value_func: str, node_idx: int = -1,
-                    subgraph_building_method='zero_filling', sample_num=1000) -> float:
-    """ monte carlo approximation of l_shapley where the target node is kept in both subgraph """
+def NC_mc_l_shapley(
+    coalition: list,
+    data: Data,
+    local_radius: int,
+    value_func: str,
+    node_idx: int = -1,
+    subgraph_building_method="zero_filling",
+    sample_num=1000,
+) -> float:
+    """monte carlo approximation of l_shapley where the target node is kept in both subgraph"""
     graph = to_networkx(data)
     num_nodes = graph.number_of_nodes()
     subgraph_build_func = get_graph_build_func(subgraph_building_method)
@@ -275,18 +330,19 @@ def NC_mc_l_shapley(coalition: list, data: Data, local_radius: int,
 
     exclude_mask = np.stack(set_exclude_masks, axis=0)
     include_mask = np.stack(set_include_masks, axis=0)
-    marginal_contributions = \
-        marginal_contribution(data, exclude_mask, include_mask, value_func, subgraph_build_func)
+    marginal_contributions = marginal_contribution(
+        data, exclude_mask, include_mask, value_func, subgraph_build_func
+    )
 
     mc_l_shapley_value = (marginal_contributions).mean().item()
     return mc_l_shapley_value
 
 
-def sparsity(coalition: list, data: Data, subgraph_building_method='zero_filling'):
-    if subgraph_building_method == 'zero_filling':
+def sparsity(coalition: list, data: Data, subgraph_building_method="zero_filling"):
+    if subgraph_building_method == "zero_filling":
         return 1.0 - len(coalition) / data.num_nodes
 
-    elif subgraph_building_method == 'split':
+    elif subgraph_building_method == "split":
         row, col = data.edge_index
         node_mask = torch.zeros(data.x.shape[0])
         node_mask[coalition] = 1.0
